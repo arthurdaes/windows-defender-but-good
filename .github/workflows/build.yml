@@ -12,10 +12,10 @@ name: build-windows
 
 on:
   push:
-    branches: [main]
+    branches: [master]
     tags: ['v*']
   pull_request:
-    branches: [main]
+    branches: [master]
   workflow_dispatch: {}
 
 permissions:
@@ -79,19 +79,23 @@ jobs:
       - name: Test
         run: |
           export CGO_ENABLED=1
-          go test ./...
+          # The `yara` tag selects the real RuleEngine (internal/scan/rules.go and
+          # its tests) over the stub; `yara_static` links libyara statically.
+          go test -tags "yara,yara_static" ./...
 
       - name: Build (fully static exe; fall back to bundling mingw runtime DLLs)
         run: |
           export CGO_ENABLED=1
           mkdir -p dist
-          if go build -tags yara_static \
+          # `yara` enables the project's real RuleEngine; `yara_static` makes
+          # go-yara link libyara statically (pkg-config --static).
+          if go build -tags "yara,yara_static" \
                -ldflags "-s -w -linkmode external -extldflags '-static'" \
                -o dist/wdbg.exe ./cmd/wdbg; then
             echo "✅ Fully static single-exe build."
           else
             echo "⚠️ Full-static failed; static libyara + dynamic mingw runtime."
-            go build -tags yara_static -ldflags "-s -w" -o dist/wdbg.exe ./cmd/wdbg
+            go build -tags "yara,yara_static" -ldflags "-s -w" -o dist/wdbg.exe ./cmd/wdbg
             for d in libgcc_s_seh-1.dll libwinpthread-1.dll; do
               cp "/mingw64/bin/$d" dist/ 2>/dev/null && echo "bundled $d" || true
             done
