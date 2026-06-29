@@ -1,0 +1,119 @@
+name: build-windows
+
+# Builds wdbg.exe on a Windows runner so you (and anyone) can download a
+# ready-to-run binary without installing Go, a C toolchain, or libyara.
+#
+# - Every push to main / manual run  -> downloadable artifact (Actions tab).
+# - Pushing a tag like v0.1.0         -> a GitHub Release with the exe attached.
+#
+# YARA isn't packaged for MSYS2, so we build libyara from source with its
+# optional deps (OpenSSL/libmagic/jansson) disabled — that keeps the static
+# link into a single self-contained exe clean.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write # needed to create releases on tag
+
+env:
+  YARA_VERSION: "4.5.5"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0} # all `run:` steps execute in the MSYS2 MinGW64 shell
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSYS2 + Go + C toolchain
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          # setup-msys2's `install:` takes explicit packages (it doesn't expand the
+          # base-devel group), so the autotools needed by yara's bootstrap are listed.
+          install: >-
+            autoconf-wrapper
+            automake-wrapper
+            autoconf2.72
+            automake1.17
+            libtool
+            m4
+            make
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-go
+            mingw-w64-x86_64-pkgconf
+            curl
+            zip
+
+      - name: Build libyara from source (static, minimal deps)
+        run: |
+          set -e
+          # YARA isn't packaged for MSYS2 and its release assets are MSVC-only, so we
+          # build from the source tag. base-devel provides the autotools bootstrap needs.
+          curl -L -o yara.tar.gz \
+            "https://github.com/VirusTotal/yara/archive/refs/tags/v${YARA_VERSION}.tar.gz"
+          tar xzf yara.tar.gz
+          cd "yara-${YARA_VERSION}"
+          # Tell the MSYS2 autotools wrappers which versions to dispatch to.
+          export AUTOCONF_VERSION=2.72 AUTOMAKE_VERSION=1.17
+          chmod +x bootstrap.sh
+          ./bootstrap.sh
+          ./configure --prefix=/mingw64 --disable-shared --enable-static \
+            --without-crypto --disable-magic --disable-cuckoo
+          make -j$(nproc)
+          make install
+          echo "libyara $(pkg-config --modversion yara) installed"
+
+      - name: Versions
+        run: go version
+
+      - name: Test
+        run: |
+          export CGO_ENABLED=1
+          go test ./...
+
+      - name: Build (fully static exe; fall back to bundling mingw runtime DLLs)
+        run: |
+          export CGO_ENABLED=1
+          mkdir -p dist
+          if go build -tags yara_static \
+               -ldflags "-s -w -linkmode external -extldflags '-static'" \
+               -o dist/wdbg.exe ./cmd/wdbg; then
+            echo "✅ Fully static single-exe build."
+          else
+            echo "⚠️ Full-static failed; static libyara + dynamic mingw runtime."
+            go build -tags yara_static -ldflags "-s -w" -o dist/wdbg.exe ./cmd/wdbg
+            for d in libgcc_s_seh-1.dll libwinpthread-1.dll; do
+              cp "/mingw64/bin/$d" dist/ 2>/dev/null && echo "bundled $d" || true
+            done
+          fi
+          ls -la dist
+
+      - name: Package zip
+        run: |
+          cd dist && zip -r ../wdbg-windows.zip . && cd ..
+          ls -la wdbg-windows.zip
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wdbg-windows
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Publish release (on version tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/wdbg.exe
+            wdbg-windows.zip
